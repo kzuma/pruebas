@@ -1,0 +1,25 @@
+# Environment
+.env
+*.env
+
+# Google credentials (never commit these)
+credentials/*.json
+!credentials/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Docker volumes
+qdrant_data/
+rag_models/
+
+# IDE
+.idea/
+.vscode/
+*.swp
