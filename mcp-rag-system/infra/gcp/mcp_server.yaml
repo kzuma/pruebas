@@ -1,0 +1,75 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: mcp-server
+  annotations:
+    # Public — Claude Desktop and claude.ai must reach this service.
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "5"
+        # VPC connector to reach Cloud Memorystore (Redis) private IP.
+        run.googleapis.com/vpc-access-connector: projects/PROJECT_ID/locations/REGION/connectors/CONNECTOR_NAME
+        run.googleapis.com/vpc-access-egress: private-ranges-only
+    spec:
+      # Service account with:
+      #   roles/run.invoker on rag-service   (identity token auth)
+      #   roles/secretmanager.secretAccessor (Secret Manager)
+      serviceAccountName: mcp-server-sa@PROJECT_ID.iam.gserviceaccount.com
+      timeoutSeconds: 60
+      containerConcurrency: 200
+      containers:
+        - image: REGION-docker.pkg.dev/PROJECT_ID/mcp-rag/mcp-server:TAG
+          ports:
+            - containerPort: 8000
+          resources:
+            limits:
+              memory: 256Mi
+              cpu: "1"
+          env:
+            # ---- RAG service ----
+            # The full HTTPS URL of the rag-service Cloud Run service.
+            # Used both as the httpx base URL and as the identity token audience.
+            - name: RAG_SERVICE_URL
+              value: https://rag-service-HASH-uc.a.run.app   # replace with actual URL after first deploy
+
+            # ---- OAuth ----
+            - name: OAUTH_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: oauth-secret-key
+                  key: latest
+            - name: OAUTH_TOKEN_EXPIRE_MINUTES
+              value: "60"
+            - name: ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: admin-username
+                  key: latest
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: admin-password
+                  key: latest
+
+            # ---- Redis (Cloud Memorystore) ----
+            # Internal VPC IP — replace with actual Memorystore IP.
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: redis-url
+                  key: latest
+
+            # ---- Cloud Run mode ----
+            - name: CLOUD_RUN_ENV
+              value: "true"
+            - name: GCP_PROJECT_ID
+              value: PROJECT_ID
+
+            # ---- CORS ----
+            # Restrict to your domain in production.
+            - name: ALLOWED_ORIGINS
+              value: "https://claude.ai,https://YOUR_DOMAIN"

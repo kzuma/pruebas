@@ -3,6 +3,12 @@ MCP tools that proxy requests to the RAG service.
 
 Each function decorated with @mcp.tool() becomes a callable tool
 that Claude can invoke through the MCP protocol.
+
+Service-to-service auth:
+  - Local (CLOUD_RUN_ENV=false): plain HTTP, no auth header.
+  - Cloud Run (CLOUD_RUN_ENV=true): attaches a Google Identity Token so the
+    RAG service can validate the caller via Cloud Run's built-in IAM check.
+    The token audience must be the full URL of the RAG Cloud Run service.
 """
 
 from __future__ import annotations
@@ -12,8 +18,30 @@ from mcp.server.fastmcp import FastMCP
 
 from auth.settings import settings
 
-# This module receives the shared FastMCP instance from main.py
-# Tools are registered via the `register_tools` helper below.
+
+def _get_auth_headers() -> dict[str, str]:
+    """
+    Return the Authorization header for internal service calls.
+
+    On Cloud Run, fetch a Google-signed ID token for the RAG service URL.
+    Locally, return empty headers.
+    """
+    if not settings.cloud_run_env:
+        return {}
+
+    try:
+        import google.auth.transport.requests as google_requests
+        import google.oauth2.id_token as id_token
+
+        audience = settings.rag_service_url.rstrip("/")
+        request  = google_requests.Request()
+        token    = id_token.fetch_id_token(request, audience)
+        return {"Authorization": f"Bearer {token}"}
+    except Exception as exc:
+        # Don't break the tool call; log and proceed without auth
+        # (Cloud Run IAM will reject the request, which surfaces to the agent)
+        print(f"[rag_tools] Warning: could not fetch identity token: {exc}")
+        return {}
 
 
 def register_tools(mcp: FastMCP) -> None:
@@ -50,6 +78,7 @@ def register_tools(mcp: FastMCP) -> None:
             response = await client.post(
                 f"{rag_url}/search",
                 json={"query": query, "top_k": top_k, "collection": collection},
+                headers=_get_auth_headers(),
             )
             response.raise_for_status()
             return response.json()
@@ -93,7 +122,11 @@ def register_tools(mcp: FastMCP) -> None:
             payload["file_id"] = file_id
 
         async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(f"{rag_url}/ingest/google-drive", json=payload)
+            response = await client.post(
+                f"{rag_url}/ingest/google-drive",
+                json=payload,
+                headers=_get_auth_headers(),
+            )
             response.raise_for_status()
             return response.json()
 
@@ -123,6 +156,7 @@ def register_tools(mcp: FastMCP) -> None:
             response = await client.get(
                 f"{rag_url}/documents",
                 params={"collection": collection, "limit": limit},
+                headers=_get_auth_headers(),
             )
             response.raise_for_status()
             return response.json()
@@ -150,6 +184,7 @@ def register_tools(mcp: FastMCP) -> None:
             response = await client.delete(
                 f"{rag_url}/documents",
                 params={"source": source, "collection": collection},
+                headers=_get_auth_headers(),
             )
             response.raise_for_status()
             return response.json()
@@ -172,7 +207,8 @@ def register_tools(mcp: FastMCP) -> None:
         """
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
-                f"{rag_url}/collections/{collection}/stats"
+                f"{rag_url}/collections/{collection}/stats",
+                headers=_get_auth_headers(),
             )
             response.raise_for_status()
             return response.json()

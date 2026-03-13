@@ -7,3 +7,9 @@ passlib[bcrypt]>=1.7.4
 python-multipart>=0.0.12
 pydantic>=2.9.0
 pydantic-settings>=2.6.0
+
+# Redis — used when REDIS_URL is set (Cloud Run / Cloud Memorystore)
+redis>=5.0.0
+
+# Google Auth — used when CLOUD_RUN_ENV=true for identity tokens
+google-auth>=2.36.0

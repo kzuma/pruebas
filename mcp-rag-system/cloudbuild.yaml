@@ -1,0 +1,131 @@
+# Cloud Build pipeline — triggered on push to main branch.
+#
+# Steps:
+#   1. Build rag-service image
+#   2. Build mcp-server image  (in parallel with step 1)
+#   3. Push both images to Artifact Registry
+#   4. Deploy rag-service to Cloud Run
+#   5. Deploy mcp-server to Cloud Run (after rag-service URL is known)
+#
+# Substitutions (set in Cloud Build trigger or passed via --substitutions):
+#   _REGION          GCP region               (default: us-central1)
+#   _REPO            Artifact Registry repo   (default: mcp-rag)
+#   _RAG_SERVICE_URL Full HTTPS URL of the already-deployed rag-service
+#                    (only needed on first deploy; subsequent deploys read it live)
+#
+# Required Cloud Build SA roles:
+#   roles/run.developer
+#   roles/artifactregistry.writer
+#   roles/iam.serviceAccountUser  (to act as the Cloud Run service accounts)
+
+substitutions:
+  _REGION: us-central1
+  _REPO: mcp-rag
+  _RAG_MIN_INSTANCES: "0"
+  _MCP_MIN_INSTANCES: "0"
+
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+  # ------------------------------------------------------------------
+  # Step 1 & 2: Build images in parallel
+  # ------------------------------------------------------------------
+  - id: build-rag-service
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/rag-service:$SHORT_SHA
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/rag-service:latest
+      - --cache-from
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/rag-service:latest
+      - ./rag_service
+    waitFor: ["-"]   # start immediately (parallel with build-mcp-server)
+
+  - id: build-mcp-server
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/mcp-server:$SHORT_SHA
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/mcp-server:latest
+      - --cache-from
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/mcp-server:latest
+      - ./mcp_server
+    waitFor: ["-"]   # start immediately (parallel with build-rag-service)
+
+  # ------------------------------------------------------------------
+  # Step 3: Push images (after both builds complete)
+  # ------------------------------------------------------------------
+  - id: push-rag-service
+    name: gcr.io/cloud-builders/docker
+    args: [push, "--all-tags",
+           "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/rag-service"]
+    waitFor: [build-rag-service]
+
+  - id: push-mcp-server
+    name: gcr.io/cloud-builders/docker
+    args: [push, "--all-tags",
+           "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/mcp-server"]
+    waitFor: [build-mcp-server]
+
+  # ------------------------------------------------------------------
+  # Step 4: Deploy rag-service
+  # ------------------------------------------------------------------
+  - id: deploy-rag-service
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - rag-service
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/rag-service:$SHORT_SHA
+      - --region=${_REGION}
+      - --ingress=internal
+      - --no-allow-unauthenticated
+      - --timeout=120
+      - --concurrency=80
+      - --memory=512Mi
+      - --cpu=1
+      - --min-instances=${_RAG_MIN_INSTANCES}
+      - --max-instances=3
+      - --quiet
+    waitFor: [push-rag-service]
+
+  # ------------------------------------------------------------------
+  # Step 5: Resolve rag-service URL, then deploy mcp-server
+  # ------------------------------------------------------------------
+  - id: deploy-mcp-server
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        RAG_URL=$(gcloud run services describe rag-service \
+          --region=${_REGION} \
+          --format="value(status.url)")
+        echo "RAG_URL=${RAG_URL}"
+        gcloud run deploy mcp-server \
+          --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/mcp-server:$SHORT_SHA \
+          --region=${_REGION} \
+          --ingress=all \
+          --allow-unauthenticated \
+          --timeout=60 \
+          --concurrency=200 \
+          --memory=256Mi \
+          --cpu=1 \
+          --min-instances=${_MCP_MIN_INSTANCES} \
+          --max-instances=5 \
+          --update-env-vars="RAG_SERVICE_URL=${RAG_URL}" \
+          --quiet
+    waitFor: [push-mcp-server, deploy-rag-service]
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/rag-service:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/rag-service:latest
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/mcp-server:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/mcp-server:latest

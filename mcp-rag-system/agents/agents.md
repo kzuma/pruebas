@@ -111,19 +111,132 @@ Toda configuración va en `.env` y se expone vía `pydantic-settings`. **Nunca h
 
 ---
 
-## 4. Roadmap / mejoras previstas
+## 4. Despliegue en GCP (Cloud Run)
+
+### Arquitectura en producción
+
+```
+Internet
+    │  HTTPS (ingress=all)
+    ▼
+Cloud Run: mcp-server                     Artifact Registry
+  SA: mcp-server-sa                       └── mcp-rag/mcp-server:tag
+  256Mi · 1CPU · max 5 instancias         └── mcp-rag/rag-service:tag
+    │
+    │  Identity Token (Cloud Run IAM)     Secret Manager
+    │  HTTPS (ingress=internal)           ├── oauth-secret-key
+    ▼                                     ├── admin-username / admin-password
+Cloud Run: rag-service                    ├── redis-url
+  SA: rag-service-sa                      ├── qdrant-host / qdrant-api-key
+  512Mi · 1CPU · max 3 instancias         └── google-drive-credentials
+    │
+    ├──▶ Qdrant Cloud (HTTPS, API key)
+    ├──▶ Vertex AI Embeddings API
+    ├──▶ Google Drive API v3
+    │
+    └──▶ Cloud Memorystore Redis (VPC privado)
+              ↑
+    VPC Serverless Connector (mcp-server también)
+```
+
+### Cambios implementados respecto al entorno local
+
+| Componente | Local (Docker Compose) | GCP (Cloud Run) |
+|---|---|---|
+| **OAuth state** | Dicts Python en memoria | Cloud Memorystore Redis (`REDIS_URL`) |
+| **Embeddings** | sentence-transformers (local, 384d) | Vertex AI `text-embedding-005` (768d) |
+| **Vector store** | Qdrant en Docker | Qdrant Cloud (API key en Secret Manager) |
+| **Credenciales Drive** | Fichero en `./credentials/` | Secret Manager → montado en `/app/credentials/` |
+| **Auth entre servicios** | HTTP sin auth | Google Identity Token (`CLOUD_RUN_ENV=true`) |
+| **Configuración sensible** | `.env` local | Secret Manager |
+| **CI/CD** | Manual | Cloud Build (`cloudbuild.yaml`) |
+
+### Variables de entorno específicas de GCP
+
+**mcp-server** (añadidas en la migración):
+
+| Variable | Descripción |
+|---|---|
+| `CLOUD_RUN_ENV=true` | Activa Identity Token auth y Redis backend |
+| `REDIS_URL` | URL privada de Cloud Memorystore, ej. `redis://10.0.0.3:6379` |
+| `GCP_PROJECT_ID` | ID del proyecto GCP |
+
+**rag-service** (añadidas en la migración):
+
+| Variable | Descripción |
+|---|---|
+| `EMBEDDING_BACKEND=vertex_ai` | Selecciona Vertex AI en lugar de sentence-transformers |
+| `VERTEX_AI_PROJECT` | ID del proyecto GCP |
+| `VERTEX_AI_LOCATION` | Región Vertex AI (default: `us-central1`) |
+| `VERTEX_AI_EMBEDDING_MODEL` | Modelo a usar (default: `text-embedding-005`) |
+
+### Archivos de infraestructura
+
+```
+infra/gcp/
+├── deploy.sh          ← Primer despliegue completo (APIs, SA, secretos, Redis, imágenes, Cloud Run)
+├── mcp_server.yaml    ← Cloud Run service spec (referencia / documentación)
+└── rag_service.yaml   ← Cloud Run service spec (referencia / documentación)
+
+cloudbuild.yaml        ← Pipeline CI/CD: build paralelo → push → deploy
+```
+
+### Primer despliegue
+
+```bash
+# 1. Edita las variables al inicio del script
+nano infra/gcp/deploy.sh
+
+# 2. Exporta las credenciales sensibles como vars (o el script las genera)
+export QDRANT_HOST="tu-cluster.qdrant.io"
+export QDRANT_API_KEY="tu-api-key"
+
+# 3. Ejecuta
+./infra/gcp/deploy.sh
+```
+
+### Nota crítica sobre dimensión de embeddings
+
+- sentence-transformers `all-MiniLM-L6-v2` → **384 dimensiones**
+- Vertex AI `text-embedding-005` → **768 dimensiones**
+
+Si cambias de backend, **la colección Qdrant debe recrearse**:
+
+```bash
+# Eliminar la colección existente
+curl -X DELETE "https://TU-QDRANT-HOST:6333/collections/documents" \
+  -H "api-key: TU-API-KEY"
+
+# La colección se crea automáticamente con la nueva dimensión al hacer la primera ingesta
+```
+
+### Costes estimados (GCP us-central1, uso moderado)
+
+| Servicio | Estimación mensual |
+|---|---|
+| Cloud Run (2 servicios, ~100k req/mes) | ~$2-5 |
+| Cloud Memorystore Redis 1GB | ~$30 |
+| Vertex AI Embeddings (1M tokens) | ~$0.10 |
+| Qdrant Cloud free tier (1GB) | $0 |
+| Secret Manager (10 secretos) | ~$0.60 |
+| **Total** | **~$35-40/mes** |
+
+---
+
+## 5. Roadmap / mejoras previstas
 
 - [ ] Migrar `print()` a `logging` estructurado (JSON) en ambos servicios
-- [ ] Añadir Redis para almacenamiento persistente de tokens OAuth
+- [x] ~~Añadir Redis para almacenamiento persistente de tokens OAuth~~ (implementado)
 - [ ] Soporte multitenancy: colecciones por `client_id` OAuth
 - [ ] Ingesta incremental: detectar ficheros nuevos/modificados en Drive por `modifiedTime`
 - [ ] Soporte para SharePoint / OneDrive como segunda fuente de documentos
 - [ ] Tests de integración con `pytest` + `httpx.AsyncClient`
-- [ ] Dashboard de métricas con Prometheus + Grafana
+- [ ] Dashboard de métricas con Cloud Monitoring + alertas
+- [ ] Terraform para gestionar toda la infraestructura GCP como código
 
 ---
 
-## 5. Reglas de seguridad mandatorias
+## 6. Reglas de seguridad mandatorias
 
 > Estas reglas se aplican en **todo cambio de código** sin excepción.
 > El agente debe revisar el código generado contra cada regla antes de hacer commit.
@@ -368,7 +481,7 @@ Los servidores MCP tienen vectores de ataque únicos derivados del hecho de que 
 
 ---
 
-## 6. Checklist de revisión para PRs
+## 7. Checklist de revisión para PRs
 
 Antes de hacer merge de cualquier cambio, verificar:
 
@@ -399,7 +512,7 @@ Antes de hacer merge de cualquier cambio, verificar:
 
 ---
 
-## 7. Glosario
+## 8. Glosario
 
 | Término | Definición |
 |---|---|

@@ -1,0 +1,85 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: rag-service
+  annotations:
+    # Only Cloud Run services inside the same project/VPC can call this service.
+    run.googleapis.com/ingress: internal
+spec:
+  template:
+    metadata:
+      annotations:
+        # Scale to zero when idle; max 3 instances to control Qdrant/Vertex AI concurrency.
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "3"
+        # VPC connector for Cloud Memorystore (Redis) and Qdrant Cloud private link.
+        # Replace REGION and CONNECTOR_NAME with your values.
+        run.googleapis.com/vpc-access-connector: projects/PROJECT_ID/locations/REGION/connectors/CONNECTOR_NAME
+        run.googleapis.com/vpc-access-egress: private-ranges-only
+    spec:
+      # Service account with:
+      #   roles/aiplatform.user         (Vertex AI embeddings)
+      #   roles/secretmanager.secretAccessor (Secret Manager)
+      #   roles/run.invoker on mcp-server   (for future callbacks if needed)
+      serviceAccountName: rag-service-sa@PROJECT_ID.iam.gserviceaccount.com
+      timeoutSeconds: 120
+      containerConcurrency: 80
+      containers:
+        - image: REGION-docker.pkg.dev/PROJECT_ID/mcp-rag/rag-service:TAG
+          ports:
+            - containerPort: 8001
+          resources:
+            limits:
+              # With Vertex AI embeddings: sentence-transformers not loaded → 512Mi is enough.
+              # With sentence-transformers: increase to 2Gi.
+              memory: 512Mi
+              cpu: "1"
+          env:
+            # ---- Qdrant Cloud ----
+            - name: QDRANT_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: qdrant-host
+                  key: latest
+            - name: QDRANT_PORT
+              value: "6333"
+            - name: QDRANT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: qdrant-api-key
+                  key: latest
+
+            # ---- Embeddings ----
+            - name: EMBEDDING_BACKEND
+              value: vertex_ai
+            - name: VERTEX_AI_PROJECT
+              value: PROJECT_ID
+            - name: VERTEX_AI_LOCATION
+              value: us-central1
+            - name: VERTEX_AI_EMBEDDING_MODEL
+              value: text-embedding-005
+
+            # ---- RAG config ----
+            - name: COLLECTION_NAME
+              value: documents
+            - name: CHUNK_SIZE
+              value: "512"
+            - name: CHUNK_OVERLAP
+              value: "64"
+
+            # ---- Google Drive credentials ----
+            # Mounted as a file at /app/credentials/google_credentials.json
+            # via the volume below — no code changes required.
+
+          volumeMounts:
+            - name: google-credentials
+              mountPath: /app/credentials
+              readOnly: true
+
+      volumes:
+        - name: google-credentials
+          secret:
+            secretName: google-drive-credentials
+            items:
+              - key: latest
+                path: google_credentials.json

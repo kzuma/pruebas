@@ -8,17 +8,25 @@ Implements the Authorization Code Flow as required by the MCP spec:
   - POST /oauth/token                              → token endpoint
   - POST /oauth/revoke                             → token revocation
 
-In production, replace the in-memory stores with a proper database
-and use a hardened identity provider (Keycloak, Auth0, etc.).
+State backend selection (controlled by REDIS_URL env var):
+  - REDIS_URL set   → RedisStateBackend  (Cloud Run / production)
+  - REDIS_URL unset → MemoryStateBackend (local Docker Compose)
+
+In production replace MemoryStateBackend with RedisStateBackend by setting
+REDIS_URL to the Cloud Memorystore private IP:
+  REDIS_URL=redis://10.0.0.3:6379
 """
 
+from __future__ import annotations
+
+import json
 import secrets
 import time
+from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, status
+from fastapi import APIRouter, Form, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -29,18 +37,115 @@ from .settings import settings
 router = APIRouter()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+
 # ---------------------------------------------------------------------------
-# In-memory stores  (replace with Redis / DB in production)
+# State backends — dual: in-memory (local) or Redis (Cloud Run)
 # ---------------------------------------------------------------------------
-_users: dict[str, str] = {}          # username → hashed_password
-_clients: dict[str, dict] = {}       # client_id → client metadata
-_auth_codes: dict[str, dict] = {}    # code → {client_id, redirect_uri, scope, user}
-_revoked_tokens: set[str] = set()    # jti of revoked tokens
+
+class _StateBackend(ABC):
+    """Abstract key/value + set store used for OAuth state."""
+
+    # Key-value (str → str, with optional TTL in seconds)
+    @abstractmethod
+    async def kv_get(self, key: str) -> str | None: ...
+    @abstractmethod
+    async def kv_set(self, key: str, value: str, ttl: int | None = None) -> None: ...
+    @abstractmethod
+    async def kv_delete(self, key: str) -> None: ...
+    @abstractmethod
+    async def kv_getdel(self, key: str) -> str | None: ...  # atomic get+delete
+
+    # Set (for revoked JTIs)
+    @abstractmethod
+    async def set_add(self, key: str, member: str) -> None: ...
+    @abstractmethod
+    async def set_contains(self, key: str, member: str) -> bool: ...
 
 
-def _bootstrap_admin() -> None:
-    """Create the admin user from env vars on startup."""
-    _users[settings.admin_username] = pwd_context.hash(settings.admin_password)
+class _MemoryStateBackend(_StateBackend):
+    """In-memory backend. Single-instance only — use for local dev."""
+
+    def __init__(self) -> None:
+        self._kv: dict[str, tuple[str, float | None]] = {}  # key → (value, expires_at)
+        self._sets: dict[str, set[str]] = {}
+
+    def _is_expired(self, key: str) -> bool:
+        if key not in self._kv:
+            return True
+        _, exp = self._kv[key]
+        return exp is not None and time.time() > exp
+
+    async def kv_get(self, key: str) -> str | None:
+        if self._is_expired(key):
+            self._kv.pop(key, None)
+            return None
+        return self._kv[key][0]
+
+    async def kv_set(self, key: str, value: str, ttl: int | None = None) -> None:
+        exp = time.time() + ttl if ttl else None
+        self._kv[key] = (value, exp)
+
+    async def kv_delete(self, key: str) -> None:
+        self._kv.pop(key, None)
+
+    async def kv_getdel(self, key: str) -> str | None:
+        value = await self.kv_get(key)
+        await self.kv_delete(key)
+        return value
+
+    async def set_add(self, key: str, member: str) -> None:
+        self._sets.setdefault(key, set()).add(member)
+
+    async def set_contains(self, key: str, member: str) -> bool:
+        return member in self._sets.get(key, set())
+
+
+class _RedisStateBackend(_StateBackend):
+    """Redis-backed backend for Cloud Run (Cloud Memorystore)."""
+
+    def __init__(self, redis_url: str) -> None:
+        import redis.asyncio as aioredis
+        self._redis = aioredis.from_url(redis_url, decode_responses=True)
+
+    async def kv_get(self, key: str) -> str | None:
+        return await self._redis.get(key)
+
+    async def kv_set(self, key: str, value: str, ttl: int | None = None) -> None:
+        if ttl:
+            await self._redis.setex(key, ttl, value)
+        else:
+            await self._redis.set(key, value)
+
+    async def kv_delete(self, key: str) -> None:
+        await self._redis.delete(key)
+
+    async def kv_getdel(self, key: str) -> str | None:
+        # Redis GETDEL is atomic (available since Redis 6.2)
+        return await self._redis.getdel(key)
+
+    async def set_add(self, key: str, member: str) -> None:
+        await self._redis.sadd(key, member)
+
+    async def set_contains(self, key: str, member: str) -> bool:
+        return bool(await self._redis.sismember(key, member))
+
+
+def _build_backend() -> _StateBackend:
+    if settings.redis_url:
+        print(f"[OAuth] Using Redis backend: {settings.redis_url[:20]}***")
+        return _RedisStateBackend(settings.redis_url)
+    print("[OAuth] Using in-memory backend (set REDIS_URL for production)")
+    return _MemoryStateBackend()
+
+
+# Module-level backend instance
+_state = _build_backend()
+
+# Namespace prefixes for Redis keys
+_NS_USER    = "oauth:user:"
+_NS_CLIENT  = "oauth:client:"
+_NS_CODE    = "oauth:code:"
+_NS_REVOKED = "oauth:revoked_jtis"
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +172,7 @@ def _create_access_token(subject: str, client_id: str, scope: str) -> str:
     return jwt.encode(payload, settings.oauth_secret_key, algorithm="HS256")
 
 
-def verify_access_token(token: str) -> dict:
+async def verify_access_token(token: str) -> dict:
     """Decode and validate a bearer token. Raises HTTPException on failure."""
     try:
         payload = jwt.decode(token, settings.oauth_secret_key, algorithms=["HS256"])
@@ -77,13 +182,21 @@ def verify_access_token(token: str) -> dict:
             detail=f"Invalid token: {exc}",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    if payload.get("jti") in _revoked_tokens:
+    if await _state.set_contains(_NS_REVOKED, payload.get("jti", "")):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token has been revoked",
             headers={"WWW-Authenticate": "Bearer"},
         )
     return payload
+
+
+async def _bootstrap_admin() -> None:
+    """Create the admin user if it does not exist (called on startup)."""
+    key = f"{_NS_USER}{settings.admin_username}"
+    if not await _state.kv_get(key):
+        hashed = pwd_context.hash(settings.admin_password)
+        await _state.kv_set(key, hashed)
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +236,7 @@ class ClientRegistrationRequest(BaseModel):
 async def register_client(body: ClientRegistrationRequest) -> JSONResponse:
     client_id = secrets.token_urlsafe(16)
     client_secret = secrets.token_urlsafe(32)
-    _clients[client_id] = {
+    client_data = {
         "client_name": body.client_name,
         "redirect_uris": body.redirect_uris,
         "grant_types": body.grant_types,
@@ -131,15 +244,15 @@ async def register_client(body: ClientRegistrationRequest) -> JSONResponse:
         "scope": body.scope,
         "client_secret": client_secret,
     }
-    return JSONResponse({
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "client_name": body.client_name,
-        "redirect_uris": body.redirect_uris,
-        "grant_types": body.grant_types,
-        "response_types": body.response_types,
-        "scope": body.scope,
-    })
+    await _state.kv_set(f"{_NS_CLIENT}{client_id}", json.dumps(client_data))
+    return JSONResponse({"client_id": client_id, **client_data})
+
+
+async def _get_client(client_id: str) -> dict:
+    raw = await _state.kv_get(f"{_NS_CLIENT}{client_id}")
+    if not raw:
+        raise HTTPException(400, f"Unknown client_id: {client_id}")
+    return json.loads(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -200,9 +313,7 @@ async def authorize_get(
 ):
     if response_type != "code":
         raise HTTPException(400, "Only response_type=code is supported")
-    if client_id not in _clients:
-        raise HTTPException(400, f"Unknown client_id: {client_id}")
-    client = _clients[client_id]
+    client = await _get_client(client_id)
     if redirect_uri not in client["redirect_uris"]:
         raise HTTPException(400, "redirect_uri not registered for this client")
 
@@ -224,33 +335,27 @@ async def authorize_post(
     username: str = Form(...),
     password: str = Form(...),
 ):
-    # Validate client
-    if client_id not in _clients:
-        raise HTTPException(400, "Unknown client")
-    client = _clients[client_id]
+    client = await _get_client(client_id)
     if redirect_uri not in client["redirect_uris"]:
         raise HTTPException(400, "Invalid redirect_uri")
 
     # Authenticate user
-    hashed = _users.get(username)
+    hashed = await _state.kv_get(f"{_NS_USER}{username}")
     if not hashed or not _verify_password(password, hashed):
         raise HTTPException(401, "Invalid credentials")
 
     # Issue authorization code (single-use, 5-minute TTL)
     code = secrets.token_urlsafe(32)
-    _auth_codes[code] = {
+    code_data = json.dumps({
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "scope": scope,
         "username": username,
-        "expires_at": time.time() + 300,
-    }
+    })
+    await _state.kv_set(f"{_NS_CODE}{code}", code_data, ttl=300)
 
     params = {"code": code, "state": state}
-    return RedirectResponse(
-        url=f"{redirect_uri}?{urlencode(params)}",
-        status_code=302,
-    )
+    return RedirectResponse(url=f"{redirect_uri}?{urlencode(params)}", status_code=302)
 
 
 # ---------------------------------------------------------------------------
@@ -266,13 +371,14 @@ async def token(
 ):
     if grant_type != "authorization_code":
         raise HTTPException(400, "Unsupported grant_type")
-    if code not in _auth_codes:
+
+    # Atomic get-and-delete to prevent code reuse
+    raw = await _state.kv_getdel(f"{_NS_CODE}{code}")
+    if not raw:
         raise HTTPException(400, "Invalid or expired authorization code")
 
-    auth_data = _auth_codes.pop(code)  # single-use
+    auth_data = json.loads(raw)
 
-    if time.time() > auth_data["expires_at"]:
-        raise HTTPException(400, "Authorization code expired")
     if auth_data["client_id"] != client_id:
         raise HTTPException(400, "client_id mismatch")
     if redirect_uri and auth_data["redirect_uri"] != redirect_uri:
@@ -301,11 +407,7 @@ async def revoke(token: str = Form(...)):
         payload = jwt.decode(
             token, settings.oauth_secret_key, algorithms=["HS256"]
         )
-        _revoked_tokens.add(payload["jti"])
+        await _state.set_add(_NS_REVOKED, payload["jti"])
     except JWTError:
         pass  # Per RFC 7009, always return 200
     return JSONResponse({"revoked": True})
-
-
-# Bootstrap admin user on import
-_bootstrap_admin()
